@@ -1,7 +1,7 @@
 import express from 'express';
 import { ThreatAnalysisInputSchema } from '../schemas/validationSchemas.js';
 import { evaluateSecurityRules } from '../services/securityRuleService.js';
-import { calculateTrustScore } from '../services/trustScoreEngine.js';
+import { calculateTrustScore, SecurityCategory } from '../services/trustScoreEngine.js';
 import { generateThreatExplanation, sendGeminiChatMessage } from '../services/geminiService.js';
 import { scanAndRedactPII } from '../services/piiService.js';
 import { supabase } from '../config/supabase.js';
@@ -13,22 +13,27 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
   try {
     const validated = ThreatAnalysisInputSchema.parse(req.body);
 
-    // 1. PII Scan & Redaction
+    // Stage 1: PII Scan & Redaction
     const piiResult = scanAndRedactPII(validated.inputText);
 
-    // 2. Security Rules Evaluation
+    // Stage 2: Deterministic Rule Engine
     const indicators = evaluateSecurityRules(validated.inputText);
 
-    // 3. Trust Score Engine
-    const scoreResult = calculateTrustScore(indicators);
+    // Stage 3: Initial Score Calculation
+    let scoreResult = calculateTrustScore(indicators);
 
-    // 4. Gemini AI Explanation
-    const aiExplanation = await generateThreatExplanation(
+    // Stage 4: Gemini Semantic Understanding (Only if non-obvious or to synthesize classification)
+    let aiExplanation = await generateThreatExplanation(
       piiResult.redactedText,
       indicators,
       scoreResult.trustScore,
       scoreResult.riskLevel
     );
+
+    // Stage 5: Final Policy & Category Fusion
+    if (aiExplanation.category && aiExplanation.category !== 'UNKNOWN' && aiExplanation.category !== 'SUSPICIOUS') {
+      scoreResult = calculateTrustScore(indicators, aiExplanation.category as SecurityCategory);
+    }
 
     let recordId = `analysis-${Date.now()}`;
 
@@ -39,71 +44,54 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
           user_id: req.user?.id,
           input_text: piiResult.redactedText,
           input_type: validated.inputType,
+          category: scoreResult.primaryCategory,
           trust_score: scoreResult.trustScore,
           risk_level: scoreResult.riskLevel,
+          decision: scoreResult.decision,
           indicators,
-          explanation: aiExplanation.explanation,
-          recommended_action: aiExplanation.recommendedAction
+          explanation: aiExplanation.reasoning,
+          recommended_action: aiExplanation.recommendation
         })
         .select()
         .single();
       if (record?.id) recordId = record.id;
-    } catch (e) {
-      console.warn('DB record write skipped (unseeded table):', e);
-    }
+    } catch (e) {}
 
     try {
       await supabase.from('audit_logs').insert({
         user_id: req.user?.id,
         action_type: 'THREAT_ANALYZED',
         resource: 'Security Analysis Center',
-        result: scoreResult.riskLevel,
+        result: `${scoreResult.primaryCategory} (${scoreResult.decision})`,
         risk_level: scoreResult.riskLevel,
         details: {
+          category: scoreResult.primaryCategory,
           trustScore: scoreResult.trustScore,
-          indicatorsCount: indicators.length,
-          piiDetectedCount: piiResult.detectedCount
+          decision: scoreResult.decision,
+          indicatorsCount: indicators.length
         }
       });
     } catch (e) {}
 
-    if (['HIGH_RISK', 'CRITICAL'].includes(scoreResult.riskLevel)) {
-      try {
-        const { data: secEvent } = await supabase.from('security_events').insert({
-          user_id: req.user?.id,
-          event_type: 'PHISHING',
-          severity: scoreResult.riskLevel === 'CRITICAL' ? 'CRITICAL' : 'HIGH',
-          source: 'Security Analysis Center',
-          risk_score: 100 - scoreResult.trustScore,
-          status: 'OPEN',
-          details: { textSnippet: piiResult.redactedText.substring(0, 100) }
-        }).select().single();
-
-        if (secEvent) {
-          await supabase.from('decisions').insert({
-            event_id: secEvent.id,
-            proposed_action: 'BLOCK_SENDER_AND_QUARANTINE',
-            risk_score: 100 - scoreResult.trustScore,
-            system_recommendation: 'REVIEW',
-            operator_decision: 'PENDING'
-          });
-        }
-      } catch (e) {}
-    }
+    const triggeredRules = indicators.map(i => i.ruleLabel);
 
     res.json({
       success: true,
       data: {
         id: recordId,
+        category: scoreResult.primaryCategory,
+        threatType: scoreResult.threatType,
+        confidence: aiExplanation.confidence || 0.95,
+        trustScore: scoreResult.trustScore,
+        riskLevel: scoreResult.riskLevel,
+        decision: scoreResult.decision,
         inputText: validated.inputText,
         redactedText: piiResult.redactedText,
         piiDetected: piiResult.piiTypesDetected,
-        trustScore: scoreResult.trustScore,
-        riskLevel: scoreResult.riskLevel,
         indicators,
-        explanation: aiExplanation.explanation,
-        recommendedAction: aiExplanation.recommendedAction,
-        aiConfidence: aiExplanation.aiConfidence
+        triggeredRules,
+        explanation: aiExplanation.reasoning,
+        recommendedAction: aiExplanation.recommendation
       }
     });
   } catch (err) {
@@ -126,12 +114,16 @@ router.post('/phishing', authenticateUser, async (req: AuthenticatedRequest, res
     res.json({
       success: true,
       data: {
-        classification: scoreResult.riskLevel === 'SAFE' ? 'SAFE' : scoreResult.riskLevel === 'REVIEW' ? 'SUSPICIOUS' : 'PHISHING',
+        category: scoreResult.primaryCategory,
+        threatType: scoreResult.threatType,
+        confidence: aiExplanation.confidence || 0.95,
         trustScore: scoreResult.trustScore,
         riskLevel: scoreResult.riskLevel,
+        decision: scoreResult.decision,
         indicators,
-        explanation: aiExplanation.explanation,
-        recommendedAction: aiExplanation.recommendedAction
+        triggeredRules: indicators.map(i => i.ruleLabel),
+        explanation: aiExplanation.reasoning,
+        recommendedAction: aiExplanation.recommendation
       }
     });
   } catch (err) {
@@ -146,14 +138,15 @@ router.post('/chat', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Message is required' });
     }
 
-    // Check if input contains URL
     let urlAnalysis = null;
     if (message.includes('http://') || message.includes('https://')) {
       const indicators = evaluateSecurityRules(message);
       const scoreResult = calculateTrustScore(indicators);
       urlAnalysis = {
+        category: scoreResult.primaryCategory,
         trustScore: scoreResult.trustScore,
         riskLevel: scoreResult.riskLevel,
+        decision: scoreResult.decision,
         indicators
       };
     }

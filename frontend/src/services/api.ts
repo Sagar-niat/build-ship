@@ -1,5 +1,3 @@
-// Relative /api path by default so deployed app works on mobile phones and all devices worldwide.
-// Falls back to VITE_API_URL if set for multi-domain deployments.
 const API_URL = import.meta.env.VITE_API_URL || '';
 
 function getAuthHeaders() {
@@ -10,95 +8,99 @@ function getAuthHeaders() {
   };
 }
 
+async function safeFetchJson(url: string, options?: RequestInit) {
+  try {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    if (!text) {
+      return { success: false, error: { message: 'Empty response received from server' } };
+    }
+    try {
+      return JSON.parse(text);
+    } catch (parseErr) {
+      return { success: false, error: { message: `Server returned invalid JSON response (HTTP ${res.status})` } };
+    }
+  } catch (err: any) {
+    return { success: false, error: { message: err.message || 'Network request failed' } };
+  }
+}
+
 export async function fetchHealth() {
-  const res = await fetch(`${API_URL}/api/health`);
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/health`);
 }
 
 export async function fetchDashboardStats() {
-  const res = await fetch(`${API_URL}/api/dashboard/stats`, { headers: getAuthHeaders() });
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/dashboard/stats`, { headers: getAuthHeaders() });
 }
 
 export async function analyzeThreat(inputText: string, inputType: string = 'MESSAGE') {
-  const res = await fetch(`${API_URL}/api/analyze/threat`, {
+  return safeFetchJson(`${API_URL}/api/analyze/threat`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ inputText, inputType })
   });
-  return res.json();
 }
 
 export async function analyzePhishing(inputText: string) {
-  const res = await fetch(`${API_URL}/api/analyze/phishing`, {
+  return safeFetchJson(`${API_URL}/api/analyze/phishing`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ inputText })
   });
-  return res.json();
 }
 
 export async function scanPII(text: string) {
-  const res = await fetch(`${API_URL}/api/privacy/scan`, {
+  return safeFetchJson(`${API_URL}/api/privacy/scan`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ text })
   });
-  return res.json();
 }
 
 export async function redactPII(text: string) {
-  const res = await fetch(`${API_URL}/api/privacy/redact`, {
+  return safeFetchJson(`${API_URL}/api/privacy/redact`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ text })
   });
-  return res.json();
 }
 
 export async function fetchSecurityEvents() {
-  const res = await fetch(`${API_URL}/api/security-events`, { headers: getAuthHeaders() });
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/security-events`, { headers: getAuthHeaders() });
 }
 
 export async function fetchAnomalies() {
-  const res = await fetch(`${API_URL}/api/anomalies`, { headers: getAuthHeaders() });
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/anomalies`, { headers: getAuthHeaders() });
 }
 
 export async function analyzeAnomaly(data: any) {
-  const res = await fetch(`${API_URL}/api/anomalies/analyze`, {
+  return safeFetchJson(`${API_URL}/api/anomalies/analyze`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify(data)
   });
-  return res.json();
 }
 
 export async function fetchDecisions() {
-  const res = await fetch(`${API_URL}/api/decisions`, { headers: getAuthHeaders() });
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/decisions`, { headers: getAuthHeaders() });
 }
 
 export async function updateDecision(id: string, operatorDecision: string, operatorNotes?: string) {
-  const res = await fetch(`${API_URL}/api/decisions/${id}`, {
+  return safeFetchJson(`${API_URL}/api/decisions/${id}`, {
     method: 'PATCH',
     headers: getAuthHeaders(),
     body: JSON.stringify({ operatorDecision, operatorNotes })
   });
-  return res.json();
 }
 
 export async function fetchAuditLogs() {
-  const res = await fetch(`${API_URL}/api/audit-logs`, { headers: getAuthHeaders() });
-  return res.json();
+  return safeFetchJson(`${API_URL}/api/audit-logs`, { headers: getAuthHeaders() });
 }
 
 export async function loginUser(credentials: any) {
-  const res = await fetch(`${API_URL}/api/auth/login`, {
+  return safeFetchJson(`${API_URL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(credentials)
   });
-  return res.json();
 }

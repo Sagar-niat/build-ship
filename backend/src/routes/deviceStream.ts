@@ -1,13 +1,12 @@
 import express from 'express';
 import { scanAndRedactPII } from '../services/piiService.js';
 import { evaluateSecurityRules } from '../services/securityRuleService.js';
-import { calculateTrustScore } from '../services/trustScoreEngine.js';
+import { calculateTrustScore, SecurityCategory } from '../services/trustScoreEngine.js';
 import { generateThreatExplanation } from '../services/geminiService.js';
 import { supabase } from '../config/supabase.js';
 
 const router = express.Router();
 
-// Mock device feed queue
 const simulatedDeviceFeed = [
   {
     id: 'msg-dev-001',
@@ -16,22 +15,28 @@ const simulatedDeviceFeed = [
     rawText: 'URGENT: Your account credentials have expired. Verify your account immediately at http://login-verify-pass.com',
     receivedAt: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
     channel: 'SMS',
-    trustScore: 30,
+    category: 'CREDENTIAL_HARVESTING',
+    trustScore: 15,
     riskLevel: 'CRITICAL',
+    decision: 'BLOCK',
     status: 'AUTO_BLOCKED',
+    triggeredRules: ['Urgency Language', 'Credential Request', 'Suspicious Domain'],
     explanation: 'Automatically blocked by TrustGuard AI due to high-risk phishing links and urgency demands.'
   },
   {
     id: 'msg-dev-002',
     sender: 'support@acme-corp.com',
     senderName: 'Acme IT Desk',
-    rawText: 'Hello team, reminder to update your quarterly security training by Friday.',
+    rawText: 'Good morning team. Meeting moved to 3 PM. Please review the attached report.',
     receivedAt: new Date(Date.now() - 1000 * 60 * 15).toISOString(),
     channel: 'EMAIL',
-    trustScore: 95,
+    category: 'SAFE',
+    trustScore: 98,
     riskLevel: 'SAFE',
+    decision: 'ALLOW',
     status: 'VERIFIED_SAFE',
-    explanation: 'Internal security communication verified as safe.'
+    triggeredRules: [],
+    explanation: 'No security threats detected.'
   },
   {
     id: 'msg-dev-003',
@@ -40,9 +45,12 @@ const simulatedDeviceFeed = [
     rawText: 'there is an urgent confirmation of your bank statements so can you please provide your credentials that we can see that, after we send an otp so you can tell right now',
     receivedAt: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
     channel: 'SMS',
-    trustScore: 33,
+    category: 'CREDENTIAL_HARVESTING',
+    trustScore: 18,
     riskLevel: 'CRITICAL',
+    decision: 'BLOCK',
     status: 'AUTO_BLOCKED',
+    triggeredRules: ['Urgency Language', 'Credential Request', 'OTP Request', 'Impersonation Words'],
     explanation: 'Automatically blocked by TrustGuard AI due to bank statement impersonation and OTP harvesting.'
   }
 ];
@@ -54,7 +62,7 @@ router.get('/messages', async (req, res) => {
 });
 
 router.get('/quarantine', async (req, res) => {
-  const quarantined = deviceStore.filter(m => (m as any).status === 'AUTO_BLOCKED');
+  const quarantined = deviceStore.filter(m => (m as any).status === 'AUTO_BLOCKED' || (m as any).decision === 'BLOCK');
   res.json({ success: true, data: quarantined });
 });
 
@@ -65,16 +73,10 @@ router.post('/incoming', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'rawText is required' });
     }
 
-    // 1. PII Scan
     const piiResult = scanAndRedactPII(rawText);
-
-    // 2. Evaluate Security Rules
     const indicators = evaluateSecurityRules(rawText);
+    let scoreResult = calculateTrustScore(indicators);
 
-    // 3. Trust Score Engine
-    const scoreResult = calculateTrustScore(indicators);
-
-    // 4. Gemini 3.6 Flash AI Explanation
     const aiExplanation = await generateThreatExplanation(
       piiResult.redactedText,
       indicators,
@@ -82,8 +84,11 @@ router.post('/incoming', async (req, res, next) => {
       scoreResult.riskLevel
     );
 
-    // 5. Strict Auto-Block Logic: Any detected risk indicator triggers Auto-Block
-    const isAutoBlocked = indicators.length > 0 || ['CRITICAL', 'HIGH_RISK', 'REVIEW'].includes(scoreResult.riskLevel) || scoreResult.trustScore < 85;
+    if (aiExplanation.category && aiExplanation.category !== 'UNKNOWN' && aiExplanation.category !== 'SUSPICIOUS') {
+      scoreResult = calculateTrustScore(indicators, aiExplanation.category as SecurityCategory);
+    }
+
+    const isAutoBlocked = scoreResult.decision === 'BLOCK' || scoreResult.riskLevel === 'CRITICAL' || scoreResult.trustScore < 40;
     const status = isAutoBlocked ? 'AUTO_BLOCKED' : 'VERIFIED_SAFE';
 
     const processedMsg = {
@@ -94,22 +99,25 @@ router.post('/incoming', async (req, res, next) => {
       redactedText: piiResult.redactedText,
       channel: channel || 'SMS',
       receivedAt: new Date().toISOString(),
+      category: scoreResult.primaryCategory,
+      threatType: scoreResult.threatType,
       trustScore: scoreResult.trustScore,
-      riskLevel: isAutoBlocked && scoreResult.riskLevel === 'SAFE' ? 'HIGH_RISK' : scoreResult.riskLevel,
+      riskLevel: scoreResult.riskLevel,
+      decision: scoreResult.decision,
       indicators,
-      explanation: aiExplanation.explanation,
-      recommendedAction: aiExplanation.recommendedAction,
+      triggeredRules: indicators.map(i => i.ruleLabel),
+      explanation: aiExplanation.reasoning,
+      recommendedAction: aiExplanation.recommendation,
       status,
-      aiConfidence: aiExplanation.aiConfidence
+      aiConfidence: aiExplanation.confidence || 0.95
     };
 
     deviceStore.unshift(processedMsg);
 
-    // 6. Save to Supabase (safely handled)
     try {
       await supabase.from('security_events').insert({
         event_type: isAutoBlocked ? 'AUTO_BLOCKED_SPAM' : 'VERIFIED_MESSAGE',
-        severity: isAutoBlocked ? 'HIGH' : 'LOW',
+        severity: scoreResult.riskLevel,
         source: `Device Guard (${channel || 'SMS'})`,
         risk_score: 100 - scoreResult.trustScore,
         status: isAutoBlocked ? 'QUARANTINED' : 'CLEARED',
@@ -119,9 +127,9 @@ router.post('/incoming', async (req, res, next) => {
       await supabase.from('audit_logs').insert({
         action_type: isAutoBlocked ? 'AUTO_BLOCKED_BY_TRUSTGUARD_AI' : 'VERIFIED_SAFE_BY_TRUSTGUARD',
         resource: `Sender: ${sender || 'Device'}`,
-        result: status,
+        result: `${scoreResult.primaryCategory} (${scoreResult.decision})`,
         risk_level: scoreResult.riskLevel,
-        details: { trustScore: scoreResult.trustScore, indicatorsCount: indicators.length }
+        details: { trustScore: scoreResult.trustScore, category: scoreResult.primaryCategory }
       });
     } catch (e) {}
 
@@ -139,6 +147,7 @@ router.post('/unblock/:id', (req, res) => {
   const item = deviceStore.find(m => m.id === id);
   if (item) {
     (item as any).status = 'MANUALLY_ALLOWED';
+    (item as any).decision = 'ALLOW';
   }
   res.json({ success: true, data: item });
 });
