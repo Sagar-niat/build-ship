@@ -1,4 +1,6 @@
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:5000';
+// Relative /api path by default so deployed app works on mobile phones and all devices worldwide.
+// Falls back to VITE_API_URL if set for multi-domain deployments.
+const API_URL = import.meta.env.VITE_API_URL || '';
 
 function getAuthHeaders() {
   const token = localStorage.getItem('trustguard_token');
