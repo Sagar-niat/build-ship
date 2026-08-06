@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const ThreatAnalysisInputSchema = z.object({
-  inputText: z.string().min(3, 'Input text must be at least 3 characters long'),
+  inputText: z.string().min(1, 'Input text must be at least 1 character long'),
   inputType: z.enum(['MESSAGE', 'EMAIL', 'URL', 'TEXT', 'SECURITY_EVENT']).default('MESSAGE')
 });
 

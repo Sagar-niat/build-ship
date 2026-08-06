@@ -12,7 +12,7 @@ export function evaluateSecurityRules(text: string): DetectedIndicator[] {
   const indicators: DetectedIndicator[] = [];
 
   // 1. Safe Conversation Fast-Filter (Normal greetings & non-malicious chat)
-  const safeConversationPattern = /^(good morning|good afternoon|good evening|hello|hi|meeting moved to|please review the attached report|happy birthday|lunch at|can you send yesterday|thanks|thank you|see you|ok|sure|got it|sounds good)(\.|\!|\?)?$/i;
+  const safeConversationPattern = /^(good morning|good afternoon|good evening|hello|hi|hey|yo|meeting moved to|please review the attached report|happy birthday|lunch at|can you send yesterday|thanks|thank you|see you|ok|sure|got it|sounds good)(\.|\!|\?)?$/i;
   if (safeConversationPattern.test(text.trim())) {
     return []; // Instantly return zero indicators -> SAFE
   }
