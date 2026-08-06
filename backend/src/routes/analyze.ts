@@ -16,24 +16,34 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
     // Stage 1: PII Scan & Redaction
     const piiResult = scanAndRedactPII(validated.inputText);
 
-    // Stage 2: Deterministic Rule Engine
-    const indicators = evaluateSecurityRules(validated.inputText);
+    // Stage 2: Rule Pre-Filter
+    const ruleIndicators = evaluateSecurityRules(validated.inputText);
+    const baseScoreResult = calculateTrustScore(ruleIndicators);
 
-    // Stage 3: Initial Score Calculation
-    let scoreResult = calculateTrustScore(indicators);
-
-    // Stage 4: Gemini Semantic Understanding (Only if non-obvious or to synthesize classification)
-    let aiExplanation = await generateThreatExplanation(
+    // Stage 3: Gemini AI Semantic Intelligence Engine
+    const aiResult = await generateThreatExplanation(
       piiResult.redactedText,
-      indicators,
-      scoreResult.trustScore,
-      scoreResult.riskLevel
+      ruleIndicators,
+      baseScoreResult.trustScore,
+      baseScoreResult.riskLevel
     );
 
-    // Stage 5: Final Policy & Category Fusion
-    if (aiExplanation.category && aiExplanation.category !== 'UNKNOWN' && aiExplanation.category !== 'SUSPICIOUS') {
-      scoreResult = calculateTrustScore(indicators, aiExplanation.category as SecurityCategory);
-    }
+    // Combine Rule Indicators with Gemini Rule Triggers
+    const triggeredRules = Array.from(new Set([
+      ...ruleIndicators.map(r => r.ruleLabel),
+      ...(aiResult.rulesTriggered || [])
+    ]));
+
+    // Determine Risk Level based on final Trust Score
+    const finalTrustScore = aiResult.trustScore !== undefined ? aiResult.trustScore : baseScoreResult.trustScore;
+    const finalDecision = aiResult.decision || baseScoreResult.decision;
+    const finalCategory = aiResult.category || baseScoreResult.primaryCategory;
+
+    let riskLevel = 'SAFE';
+    if (finalTrustScore <= 19 || finalDecision === 'BLOCK') riskLevel = 'CRITICAL';
+    else if (finalTrustScore <= 39 || finalDecision === 'REVIEW') riskLevel = 'HIGH';
+    else if (finalTrustScore <= 69 || finalDecision === 'WARN') riskLevel = 'MEDIUM';
+    else if (finalTrustScore <= 89) riskLevel = 'LOW';
 
     let recordId = `analysis-${Date.now()}`;
 
@@ -44,13 +54,13 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
           user_id: req.user?.id,
           input_text: piiResult.redactedText,
           input_type: validated.inputType,
-          category: scoreResult.primaryCategory,
-          trust_score: scoreResult.trustScore,
-          risk_level: scoreResult.riskLevel,
-          decision: scoreResult.decision,
-          indicators,
-          explanation: aiExplanation.reasoning,
-          recommended_action: aiExplanation.recommendation
+          category: finalCategory,
+          trust_score: finalTrustScore,
+          risk_level: riskLevel,
+          decision: finalDecision,
+          indicators: ruleIndicators,
+          explanation: aiResult.reasoning,
+          recommended_action: aiResult.recommendation
         })
         .select()
         .single();
@@ -62,36 +72,34 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
         user_id: req.user?.id,
         action_type: 'THREAT_ANALYZED',
         resource: 'Security Analysis Center',
-        result: `${scoreResult.primaryCategory} (${scoreResult.decision})`,
-        risk_level: scoreResult.riskLevel,
+        result: `${finalCategory} (${finalDecision})`,
+        risk_level: riskLevel,
         details: {
-          category: scoreResult.primaryCategory,
-          trustScore: scoreResult.trustScore,
-          decision: scoreResult.decision,
-          indicatorsCount: indicators.length
+          category: finalCategory,
+          trustScore: finalTrustScore,
+          decision: finalDecision,
+          isLiveAi: aiResult.isLiveAi
         }
       });
     } catch (e) {}
-
-    const triggeredRules = indicators.map(i => i.ruleLabel);
 
     res.json({
       success: true,
       data: {
         id: recordId,
-        category: scoreResult.primaryCategory,
-        threatType: scoreResult.threatType,
-        confidence: aiExplanation.confidence || 0.95,
-        trustScore: scoreResult.trustScore,
-        riskLevel: scoreResult.riskLevel,
-        decision: scoreResult.decision,
+        category: finalCategory,
+        threatType: finalCategory === 'SAFE' ? 'Normal Conversation' : `${finalCategory.replace(/_/g, ' ')} Threat`,
+        confidence: aiResult.confidence || 0.98,
+        trustScore: finalTrustScore,
+        riskLevel,
+        decision: finalDecision,
         inputText: validated.inputText,
         redactedText: piiResult.redactedText,
         piiDetected: piiResult.piiTypesDetected,
-        indicators,
+        indicators: ruleIndicators,
         triggeredRules,
-        explanation: aiExplanation.reasoning,
-        recommendedAction: aiExplanation.recommendation
+        explanation: aiResult.reasoning,
+        recommendedAction: aiResult.recommendation
       }
     });
   } catch (err) {
@@ -102,28 +110,29 @@ router.post('/threat', authenticateUser, async (req: AuthenticatedRequest, res, 
 router.post('/phishing', authenticateUser, async (req: AuthenticatedRequest, res, next) => {
   try {
     const validated = ThreatAnalysisInputSchema.parse(req.body);
-    const indicators = evaluateSecurityRules(validated.inputText);
-    const scoreResult = calculateTrustScore(indicators);
-    const aiExplanation = await generateThreatExplanation(
+    const ruleIndicators = evaluateSecurityRules(validated.inputText);
+    const baseScoreResult = calculateTrustScore(ruleIndicators);
+
+    const aiResult = await generateThreatExplanation(
       validated.inputText,
-      indicators,
-      scoreResult.trustScore,
-      scoreResult.riskLevel
+      ruleIndicators,
+      baseScoreResult.trustScore,
+      baseScoreResult.riskLevel
     );
 
     res.json({
       success: true,
       data: {
-        category: scoreResult.primaryCategory,
-        threatType: scoreResult.threatType,
-        confidence: aiExplanation.confidence || 0.95,
-        trustScore: scoreResult.trustScore,
-        riskLevel: scoreResult.riskLevel,
-        decision: scoreResult.decision,
-        indicators,
-        triggeredRules: indicators.map(i => i.ruleLabel),
-        explanation: aiExplanation.reasoning,
-        recommendedAction: aiExplanation.recommendation
+        category: aiResult.category,
+        threatType: `${aiResult.category} Threat`,
+        confidence: aiResult.confidence || 0.98,
+        trustScore: aiResult.trustScore,
+        riskLevel: aiResult.decision === 'BLOCK' ? 'CRITICAL' : 'SAFE',
+        decision: aiResult.decision,
+        indicators: ruleIndicators,
+        triggeredRules: Array.from(new Set([...ruleIndicators.map(r => r.ruleLabel), ...(aiResult.rulesTriggered || [])])),
+        explanation: aiResult.reasoning,
+        recommendedAction: aiResult.recommendation
       }
     });
   } catch (err) {

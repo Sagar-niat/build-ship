@@ -6,6 +6,9 @@ import { SecurityCategory } from './trustScoreEngine.js';
 const GeminiClassificationSchema = z.object({
   category: z.string(),
   confidence: z.number().min(0).max(1),
+  trustScore: z.number().min(0).max(100),
+  decision: z.enum(['ALLOW', 'WARN', 'REVIEW', 'BLOCK', 'HUMAN_REVIEW']),
+  rulesTriggered: z.array(z.string()).default([]),
   reasoning: z.string(),
   recommendation: z.string()
 });
@@ -13,6 +16,9 @@ const GeminiClassificationSchema = z.object({
 export interface GeminiClassificationResult {
   category: SecurityCategory;
   confidence: number;
+  trustScore: number;
+  decision: 'ALLOW' | 'WARN' | 'REVIEW' | 'BLOCK' | 'HUMAN_REVIEW';
+  rulesTriggered: string[];
   reasoning: string;
   recommendation: string;
   isLiveAi?: boolean;
@@ -20,24 +26,26 @@ export interface GeminiClassificationResult {
 
 export async function generateThreatExplanation(
   inputText: string,
-  indicators: DetectedIndicator[],
-  trustScore: number,
-  riskLevel: string
+  ruleIndicators: DetectedIndicator[],
+  baseTrustScore: number,
+  baseRiskLevel: string
 ): Promise<GeminiClassificationResult> {
   const apiKey = process.env.GEMINI_API_KEY;
 
-  // Safe fallback if zero indicators exist or API key unavailable
-  const isSafeText = !indicators || indicators.length === 0;
+  const isSafeRuleText = !ruleIndicators || ruleIndicators.length === 0;
 
   const fallbackReport: GeminiClassificationResult = {
-    category: isSafeText ? 'SAFE' : 'SUSPICIOUS',
-    confidence: isSafeText ? 0.99 : 0.92,
-    reasoning: isSafeText
-      ? 'No security threats detected in this input.'
-      : `Telemetry evaluation indicates a ${riskLevel} security event. Identified risk factors: ${indicators.map(i => i.ruleLabel).join(', ')}.`,
-    recommendation: isSafeText
+    category: isSafeRuleText ? 'SAFE' : 'CREDENTIAL_HARVESTING',
+    confidence: isSafeRuleText ? 0.99 : 0.95,
+    trustScore: isSafeRuleText ? 98 : baseTrustScore,
+    decision: isSafeRuleText ? 'ALLOW' : baseTrustScore < 40 ? 'BLOCK' : 'WARN',
+    rulesTriggered: ruleIndicators.map(r => r.ruleLabel),
+    reasoning: isSafeRuleText
+      ? 'Everyday conversation without security threats or suspicious commands.'
+      : `Message contains security indicators (${ruleIndicators.map(r => r.ruleLabel).join(', ')}).`,
+    recommendation: isSafeRuleText
       ? 'No security threats detected.'
-      : 'Exercise caution and verify sender through out-of-band channels.',
+      : 'Do not share OTPs, credentials, or personal bank details.',
     isLiveAi: false
   };
 
@@ -52,33 +60,61 @@ export async function generateThreatExplanation(
       const genAI = new GoogleGenerativeAI(apiKey);
       const model = genAI.getGenerativeModel({ model: modelName });
 
-      const prompt = `You are an expert Cybersecurity Operations Analyst at TrustGuard AI.
-Classify the following incoming telemetry payload into one of these strict categories:
-[SAFE, SPAM, PHISHING, SCAM, SOCIAL_ENGINEERING, MALWARE_DELIVERY, DATA_EXFILTRATION, CREDENTIAL_HARVESTING, BUSINESS_EMAIL_COMPROMISE, IMPERSONATION, FINANCIAL_FRAUD, SUSPICIOUS, UNKNOWN]
+      const prompt = `You are Gemini 3.6 Flash, the principal AI Security Intelligence Analyst for TrustGuard AI.
+Analyze the following incoming user message / command and determine its true intent, security category, trust score (0-100), and policy decision.
 
-Input Text: "${inputText}"
-Calculated Rule Indicators: ${JSON.stringify(indicators, null, 2)}
-Trust Score: ${trustScore}/100
+INPUT MESSAGE TO ANALYZE:
+"${inputText}"
 
-Respond ONLY in strict JSON format:
+RULE PRE-FILTER INDICATORS DETECTED:
+${JSON.stringify(ruleIndicators, null, 2)}
+
+CLASSIFICATION CATEGORIES AVAILABLE:
+1. SAFE - Everyday normal conversation (e.g. "Good morning", "Meeting at 3 PM", "Lunch at 2?", "Thanks")
+2. SPAM - Unwanted marketing/promotions (e.g. "Buy followers", "50% discount", "You won a free gift")
+3. PHISHING - Login link theft, fake websites
+4. SCAM - Lottery, crypto, job, UPI, investment fraud
+5. SOCIAL_ENGINEERING - Manager pressure, secrecy demands
+6. MALWARE_DELIVERY - Executable download, zip, macro files
+7. DATA_EXFILTRATION - Database export, payroll, admin password requests
+8. CREDENTIAL_HARVESTING - Asking for OTP, password, PIN, bank balance fetching credentials (e.g. "send me the otp for bank balance fetching")
+9. BUSINESS_EMAIL_COMPROMISE - Executive wire transfer coercion
+10. IMPERSONATION - Fake bank, Microsoft, Amazon, CEO, HR, IT Support
+11. FINANCIAL_FRAUD - Money transfer pressure, fake billing
+12. SUSPICIOUS - Borderline ambiguous content
+13. UNKNOWN - Insufficient context
+
+POLICY DECISION RULES:
+- SAFE / LOW RISK (Score 90-100) -> ALLOW
+- SPAM / MEDIUM RISK (Score 40-69) -> WARN
+- HIGH RISK (Score 20-39) -> REVIEW
+- CRITICAL / OTP THEFT / PHISHING / EXFILTRATION (Score 0-19) -> BLOCK
+
+Respond STRICTLY in JSON:
 {
   "category": "SAFE|SPAM|PHISHING|SCAM|SOCIAL_ENGINEERING|MALWARE_DELIVERY|DATA_EXFILTRATION|CREDENTIAL_HARVESTING|BUSINESS_EMAIL_COMPROMISE|IMPERSONATION|FINANCIAL_FRAUD|SUSPICIOUS|UNKNOWN",
-  "confidence": 0.95,
-  "reasoning": "Clear prose explaining why this classification was assigned",
-  "recommendation": "Actionable security recommendation or 'No security threats detected.'"
+  "confidence": 0.98,
+  "trustScore": 18,
+  "decision": "ALLOW|WARN|REVIEW|BLOCK|HUMAN_REVIEW",
+  "rulesTriggered": ["OTP Request", "Financial Keywords"],
+  "reasoning": "Clear explanation of why this classification was assigned",
+  "recommendation": "Actionable security advice or 'No security threats detected.'"
 }
-Do not include markdown code block backticks outside JSON.`;
+Do not wrap JSON in markdown backticks outside the valid JSON object.`;
 
       const result = await model.generateContent(prompt);
       const rawText = result.response.text().trim();
       const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-      
+
       const parsed = JSON.parse(cleanJson);
       const validated = GeminiClassificationSchema.parse(parsed);
 
       return {
         category: validated.category as SecurityCategory,
         confidence: validated.confidence,
+        trustScore: validated.trustScore,
+        decision: validated.decision,
+        rulesTriggered: validated.rulesTriggered.length > 0 ? validated.rulesTriggered : ruleIndicators.map(r => r.ruleLabel),
         reasoning: validated.reasoning,
         recommendation: validated.recommendation,
         isLiveAi: true
